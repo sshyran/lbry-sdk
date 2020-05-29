@@ -55,7 +55,7 @@ class ClientSession(BaseClientSession):
         return result
 
     async def send_request(self, method, args=()):
-        log.info("%i in flight, send %s%s to %s:%i ", self.pending_amount, method, tuple(args), *self.server)
+        log.debug("%i in flight, send %s%s to %s:%i ", self.pending_amount, method, tuple(args), *self.server)
         self.pending_amount += 1
         try:
             if method == 'server.version':
@@ -92,7 +92,7 @@ class ClientSession(BaseClientSession):
             raise
         finally:
             self.pending_amount -= 1
-            log.info("%i in flight, finished %s%s ", self.pending_amount, method, tuple(args))
+            log.debug("%i in flight, finished %s%s ", self.pending_amount, method, tuple(args))
 
     async def ensure_session(self):
         # Handles reconnecting and maintaining a session alive
