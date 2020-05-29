@@ -173,13 +173,16 @@ class History:
 
         self.logger.info(f'backing up removed {nremoves:,d} history entries')
 
-    def get_txnums(self, hashX, limit=1000):
+    def get_txnums(self, hashX, limit=1000, start=0):
         """Generator that returns an unpruned, sorted list of tx_nums in the
         history of a hashX.  Includes both spending and receiving
         transactions.  By default yields at most 1000 entries.  Set
         limit to None to get them all.  """
         limit = util.resolve_limit(limit)
-        for key, hist in self.db.iterator(prefix=hashX):
+        start = hashX + pack_be_uint16(start)
+        for key, hist in self.db.iterator(start=start):
+            if not key.startswith(hashX):
+                break
             a = array.array('I')
             a.frombytes(hist)
             for tx_num in a:

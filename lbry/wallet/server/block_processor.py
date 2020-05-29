@@ -1,8 +1,9 @@
 import time
 import asyncio
+from collections import defaultdict
 from struct import pack, unpack
 from concurrent.futures.thread import ThreadPoolExecutor
-from typing import Optional
+from typing import Optional, NamedTuple, DefaultDict, List, Tuple
 from prometheus_client import Gauge, Histogram
 import lbry
 from lbry.schema.claim import Claim
@@ -135,6 +136,15 @@ HISTOGRAM_BUCKETS = (
 )
 
 
+class HashXHistoryCache(NamedTuple):
+    cache: List[Tuple[str, int]]
+    lock: asyncio.Lock
+
+    @staticmethod
+    def init() -> 'HashXHistoryCache':
+        return HashXHistoryCache([], asyncio.Lock())
+
+
 class BlockProcessor:
     """Process blocks and update the DB state to match.
 
@@ -183,7 +193,8 @@ class BlockProcessor:
         self.state_lock = asyncio.Lock()
 
         self.search_cache = {}
-        self.history_cache = {}
+        self.history_cache: DefaultDict[str, HashXHistoryCache] = defaultdict(HashXHistoryCache.init)
+        self.recent_history_cache: DefaultDict[str, HashXHistoryCache] = defaultdict(HashXHistoryCache.init)
 
     async def run_in_thread_with_lock(self, func, *args):
         # Run in a thread to prevent blocking.  Shielded so that
@@ -214,7 +225,14 @@ class BlockProcessor:
             await self.run_in_thread_with_lock(self.advance_blocks, blocks)
             for cache in self.search_cache.values():
                 cache.clear()
-            self.history_cache.clear()
+            while self.recent_history_cache:
+                hashX, hot_cache = self.recent_history_cache.popitem()
+                for (_txid, _height) in hot_cache.cache:
+                    if _height <= first:
+                        self.history_cache[hashX].cache.append((_txid, _height))
+                    else:
+                        break
+
             await self._maybe_flush()
             processed_time = time.perf_counter() - start
             self.block_count_metric.set(self.height)

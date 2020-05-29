@@ -434,7 +434,7 @@ class LevelDB:
 
         return [self.coin.header_hash(header) for header in headers]
 
-    async def limited_history(self, hashX, *, limit=1000):
+    async def limited_history(self, hashX, *, limit=1000, start=0):
         """Return an unpruned, sorted list of (tx_hash, height) tuples of
         confirmed transactions that touched the address, earliest in
         the blockchain first.  Includes both spending and receiving
@@ -442,7 +442,7 @@ class LevelDB:
         limit to None to get them all.
         """
         def read_history():
-            tx_nums = list(self.history.get_txnums(hashX, limit))
+            tx_nums = list(self.history.get_txnums(hashX, limit, start))
             fs_tx_hash = self.fs_tx_hash
             return [fs_tx_hash(tx_num) for tx_num in tx_nums]
 

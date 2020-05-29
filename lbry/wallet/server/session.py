@@ -123,6 +123,7 @@ HISTOGRAM_BUCKETS = (
     .005, .01, .025, .05, .075, .1, .25, .5, .75, 1.0, 2.5, 5.0, 7.5, 10.0, 15.0, 20.0, 30.0, 60.0, float('inf')
 )
 
+
 class SessionManager:
     """Holds global state about all sessions."""
 
@@ -178,6 +179,7 @@ class SessionManager:
         self.txs_sent = 0
         self.start_time = time.time()
         self.history_cache = self.bp.history_cache
+        self.recent_history_cache = self.bp.recent_history_cache
         self.notified_height: typing.Optional[int] = None
         # Cache some idea of room to avoid recounting on each subscription
         self.subs_room = 0
@@ -607,15 +609,29 @@ class SessionManager:
         return hex_hash
 
     async def limited_history(self, hashX):
-        """A caching layer."""
-        if hashX not in self.history_cache:
-            # History DoS limit.  Each element of history is about 99
-            # bytes when encoded as JSON.  This limits resource usage
-            # on bloated history requests, and uses a smaller divisor
-            # so large requests are logged before refusing them.
-            limit = self.env.max_send // 97
-            self.history_cache[hashX] = await self.db.limited_history(hashX, limit=limit)
-        return self.history_cache[hashX]
+        # History DoS limit.  Each element of history is about 99
+        # bytes when encoded as JSON.  This limits resource usage
+        # on bloated history requests, and uses a smaller divisor
+        # so large requests are logged before refusing them.
+        limit = self.env.max_send // 97
+
+        if hashX in self.recent_history_cache:
+            return self.recent_history_cache[hashX].cache
+
+        hot_cache = self.recent_history_cache[hashX]
+        history_cache = self.history_cache[hashX]
+        async with history_cache.lock:
+            db_history = await self.db.limited_history(hashX, limit=limit, start=len(self.history_cache[hashX]))
+            if not db_history:
+                return []
+            uncached = 0
+            for txid, height in db_history:
+                if height >= self.bp.height - self.bp.coin.REORG_LIMIT:
+                    break
+                history_cache.cache.append((txid, height))
+                uncached += 1
+            hot_cache.cache.extend(history_cache.cache + db_history[uncached:])
+        return hot_cache.cache
 
     async def _notify_sessions(self, height, touched):
         """Notify sessions about height changes and touched addresses."""
@@ -954,9 +970,11 @@ class LBRYElectrumX(SessionBase):
                     method = 'blockchain.scripthash.subscribe'
                 else:
                     method = 'blockchain.address.subscribe'
-                start = time.perf_counter()
+                # start = time.perf_counter()
                 t = asyncio.create_task(self.send_notification(method, (alias, status)))
-                t.add_done_callback(lambda _: self.logger.info("sent notification to %s in %s", alias, time.perf_counter() - start))
+                # t.add_done_callback(
+                #     lambda _: self.logger.info("sent notification to %s in %s", alias, time.perf_counter() - start)
+                # )
 
             if changed:
                 es = '' if len(changed) == 1 else 'es'
