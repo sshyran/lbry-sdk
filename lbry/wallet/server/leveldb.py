@@ -34,6 +34,7 @@ from lbry.wallet.server.history import History
 UTXO = namedtuple("UTXO", "tx_num tx_pos tx_hash height value")
 HEADER_PREFIX = b'H'
 TX_COUNT_PREFIX = b'T'
+TX_HASH_PREFIX = b'X'
 
 
 @attr.s(slots=True)
@@ -84,8 +85,6 @@ class LevelDB:
         path = partial(os.path.join, self.env.db_dir)
         self.meta_db = None
 
-        self.hashes_file = util.LogicalFile(path('meta/hashes'), 4, 16000000)
-
         if not self.coin.STATIC_BLOCK_HEADERS:
             self.headers_offsets_file = util.LogicalFile(
                 path('meta/headers_offsets'), 2, 16000000)
@@ -95,10 +94,14 @@ class LevelDB:
             return
         # tx_counts[N] has the cumulative number of txs at the end of
         # height N.  So tx_counts[0] is 1 - the genesis coinbase
-        tx_counts = tuple(
-            util.unpack_le_uint64_from(cnt)[0]
-            for cnt in self.meta_db.iterator(prefix=TX_COUNT_PREFIX, include_key=False)
-        )
+
+        def get_counts():
+            return tuple(
+                util.unpack_le_uint64_from(cnt)[0]
+                for cnt in self.meta_db.iterator(prefix=TX_COUNT_PREFIX, include_key=False)
+            )
+
+        tx_counts = await asyncio.get_event_loop().run_in_executor(self.executor, get_counts)
         assert len(tx_counts) == (self.db_height + 1), f"{len(tx_counts)} vs {self.db_height + 1}"
         self.tx_counts = array.array('I', tx_counts)
 
@@ -256,7 +259,6 @@ class LevelDB:
                                        else 0)
         assert len(self.tx_counts) == flush_data.height + 1
         hashes = b''.join(flush_data.block_tx_hashes)
-        flush_data.block_tx_hashes.clear()
         assert len(hashes) % 32 == 0
         assert len(hashes) // 32 == flush_data.tx_count - prior_tx_count
 
@@ -269,12 +271,20 @@ class LevelDB:
             header_height += 1
         flush_data.headers.clear()
 
+        tx_num = prior_tx_count
+        for tx_hashes in flush_data.block_tx_hashes:
+            offset = 0
+            while offset < len(tx_hashes):
+                tx_hash = tx_hashes[offset:offset+32]
+                offset += 32
+                self.meta_db.put(TX_HASH_PREFIX + util.pack_le_uint64(tx_num), tx_hash)
+                tx_num += 1
+        flush_data.block_tx_hashes.clear()
+
         count_height = height_start
         for tx_count in self.tx_counts[height_start:]:
             self.meta_db.put(TX_COUNT_PREFIX + util.pack_le_uint64(count_height), util.pack_le_uint64(tx_count))
             count_height += 1
-        offset = prior_tx_count * 32
-        self.hashes_file.write(offset, hashes)
 
         self.fs_height = flush_data.height
         self.fs_tx_count = flush_data.tx_count
@@ -414,7 +424,7 @@ class LevelDB:
         if tx_height > self.db_height:
             tx_hash = None
         else:
-            tx_hash = self.hashes_file.read(tx_num * 32, 32)
+            tx_hash = self.meta_db.get(TX_HASH_PREFIX + util.pack_le_uint64(tx_num))
         return tx_hash, tx_height
 
     async def fs_block_hashes(self, height, count):
