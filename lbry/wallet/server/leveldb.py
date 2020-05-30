@@ -85,10 +85,6 @@ class LevelDB:
         path = partial(os.path.join, self.env.db_dir)
         self.meta_db = None
 
-        if not self.coin.STATIC_BLOCK_HEADERS:
-            self.headers_offsets_file = util.LogicalFile(
-                path('meta/headers_offsets'), 2, 16000000)
-
     async def _read_tx_counts(self):
         if self.tx_counts is not None:
             return
@@ -114,6 +110,10 @@ class LevelDB:
         self.meta_db = self.db_class('headers', for_sync)
         if self.meta_db.is_new:
             self.logger.info('created new headers db')
+            coin_path = os.path.join(self.env.db_dir, 'COIN')
+            with util.open_file(coin_path, create=True) as f:
+                f.write(f'ElectrumX databases and metadata for '
+                        f'{self.coin.NAME} {self.coin.NET}'.encode())
         else:
             self.logger.info(f'opened headers DB (for sync: {for_sync})')
 
@@ -123,13 +123,7 @@ class LevelDB:
         if self.utxo_db.is_new:
             self.logger.info('created new database')
             self.logger.info('creating metadata directory')
-            os.mkdir(os.path.join(self.env.db_dir, 'meta'))
-            coin_path = os.path.join(self.env.db_dir, 'meta', 'COIN')
-            with util.open_file(coin_path, create=True) as f:
-                f.write(f'ElectrumX databases and metadata for '
-                        f'{self.coin.NAME} {self.coin.NET}'.encode())
-            if not self.coin.STATIC_BLOCK_HEADERS:
-                self.headers_offsets_file.write(0, bytes(8))
+
         else:
             self.logger.info(f'opened UTXO DB (for sync: {for_sync})')
         self.read_utxo_state()
@@ -369,15 +363,6 @@ class LevelDB:
                          f'{elapsed:.1f}s.  Height {flush_data.height:,d} '
                          f'txs: {flush_data.tx_count:,d} ({tx_delta:+,d})')
 
-    def dynamic_header_offset(self, height):
-        assert not self.coin.STATIC_BLOCK_HEADERS
-        offset, = unpack('<Q', self.headers_offsets_file.read(height * 8, 8))
-        return offset
-
-    def dynamic_header_len(self, height):
-        return self.dynamic_header_offset(height + 1)\
-               - self.dynamic_header_offset(height)
-
     def backup_fs(self, height, tx_count):
         """Back up during a reorg.  This just updates our pointers."""
         self.fs_height = height
@@ -479,7 +464,7 @@ class LevelDB:
             batch_put(self.undo_key(height), b''.join(undo_info))
 
     def raw_block_prefix(self):
-        return 'meta/block'
+        return 'block'
 
     def raw_block_path(self, height):
         return os.path.join(self.env.db_dir, f'{self.raw_block_prefix()}{height:d}')
