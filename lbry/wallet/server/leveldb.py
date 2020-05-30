@@ -107,7 +107,7 @@ class LevelDB:
             assert self.db_tx_count == 0
 
     async def _open_dbs(self, for_sync, compacting):
-        self.meta_db = self.db_class('headers', for_sync)
+        self.meta_db = self.db_class('meta', for_sync)
         if self.meta_db.is_new:
             self.logger.info('created new headers db')
             coin_path = os.path.join(self.env.db_dir, 'COIN')
