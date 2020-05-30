@@ -33,6 +33,7 @@ from lbry.wallet.server.history import History
 
 UTXO = namedtuple("UTXO", "tx_num tx_pos tx_hash height value")
 HEADER_PREFIX = b'H'
+TX_COUNT_PREFIX = b'T'
 
 
 @attr.s(slots=True)
@@ -82,8 +83,9 @@ class LevelDB:
 
         path = partial(os.path.join, self.env.db_dir)
         self.meta_db = None
-        self.tx_counts_file = util.LogicalFile(path('meta/txcounts'), 2, 2000000)
+
         self.hashes_file = util.LogicalFile(path('meta/hashes'), 4, 16000000)
+
         if not self.coin.STATIC_BLOCK_HEADERS:
             self.headers_offsets_file = util.LogicalFile(
                 path('meta/headers_offsets'), 2, 16000000)
@@ -93,10 +95,13 @@ class LevelDB:
             return
         # tx_counts[N] has the cumulative number of txs at the end of
         # height N.  So tx_counts[0] is 1 - the genesis coinbase
-        size = (self.db_height + 1) * 4
-        tx_counts = self.tx_counts_file.read(0, size)
-        assert len(tx_counts) == size
+        tx_counts = tuple(
+            util.unpack_le_uint64_from(cnt)[0]
+            for cnt in self.meta_db.iterator(prefix=TX_COUNT_PREFIX, include_key=False)
+        )
+        assert len(tx_counts) == (self.db_height + 1), f"{len(tx_counts)} vs {self.db_height + 1}"
         self.tx_counts = array.array('I', tx_counts)
+
         if self.tx_counts:
             assert self.db_tx_count == self.tx_counts[-1]
         else:
@@ -264,9 +269,10 @@ class LevelDB:
             header_height += 1
         flush_data.headers.clear()
 
-        offset = height_start * self.tx_counts.itemsize
-        self.tx_counts_file.write(offset,
-                                  self.tx_counts[height_start:].tobytes())
+        count_height = height_start
+        for tx_count in self.tx_counts[height_start:]:
+            self.meta_db.put(TX_COUNT_PREFIX + util.pack_le_uint64(count_height), util.pack_le_uint64(tx_count))
+            count_height += 1
         offset = prior_tx_count * 32
         self.hashes_file.write(offset, hashes)
 
