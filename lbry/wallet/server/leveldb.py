@@ -32,6 +32,7 @@ from lbry.wallet.server.history import History
 
 
 UTXO = namedtuple("UTXO", "tx_num tx_pos tx_hash height value")
+HEADER_PREFIX = b'H'
 
 
 @attr.s(slots=True)
@@ -65,14 +66,6 @@ class LevelDB:
         self.coin = env.coin
         self.executor = ThreadPoolExecutor(max(1, os.cpu_count() - 1))
 
-        # Setup block header size handlers
-        if self.coin.STATIC_BLOCK_HEADERS:
-            self.header_offset = self.coin.static_header_offset
-            self.header_len = self.coin.static_header_len
-        else:
-            self.header_offset = self.dynamic_header_offset
-            self.header_len = self.dynamic_header_len
-
         self.logger.info(f'switching current directory to {env.db_dir}')
 
         self.db_class = db_class(env.db_dir, self.env.db_engine)
@@ -88,7 +81,7 @@ class LevelDB:
         self.header_mc = MerkleCache(self.merkle, self.fs_block_hashes)
 
         path = partial(os.path.join, self.env.db_dir)
-        self.headers_file = util.LogicalFile(path('meta/headers'), 2, 16000000)
+        self.meta_db = None
         self.tx_counts_file = util.LogicalFile(path('meta/txcounts'), 2, 2000000)
         self.hashes_file = util.LogicalFile(path('meta/hashes'), 4, 16000000)
         if not self.coin.STATIC_BLOCK_HEADERS:
@@ -110,8 +103,13 @@ class LevelDB:
             assert self.db_tx_count == 0
 
     async def _open_dbs(self, for_sync, compacting):
-        assert self.utxo_db is None
+        self.meta_db = self.db_class('headers', for_sync)
+        if self.meta_db.is_new:
+            self.logger.info('created new headers db')
+        else:
+            self.logger.info(f'opened headers DB (for sync: {for_sync})')
 
+        assert self.utxo_db is None
         # First UTXO DB
         self.utxo_db = self.db_class('utxo', for_sync)
         if self.utxo_db.is_new:
@@ -129,9 +127,9 @@ class LevelDB:
         self.read_utxo_state()
 
         # Then history DB
-        self.utxo_flush_count = self.history.open_db(self.db_class, for_sync,
-                                                     self.utxo_flush_count,
-                                                     compacting)
+        self.utxo_flush_count = self.history.open_db(
+            self.db_class, for_sync, self.utxo_flush_count, compacting
+        )
         self.clear_excess_undo_info()
 
         # Read TX counts (requires meta directory)
@@ -140,6 +138,7 @@ class LevelDB:
     def close(self):
         self.utxo_db.close()
         self.history.close_db()
+        self.meta_db.close()
         self.executor.shutdown(wait=True)
 
     async def open_for_compacting(self):
@@ -163,6 +162,9 @@ class LevelDB:
             self.utxo_db.close()
             self.history.close_db()
             self.utxo_db = None
+        if self.meta_db:
+            self.meta_db.close()
+            self.meta_db = None
         await self._open_dbs(False, False)
 
     # Header merkle cache
@@ -256,9 +258,10 @@ class LevelDB:
         # Write the headers, tx counts, and tx hashes
         start_time = time.time()
         height_start = self.fs_height + 1
-        offset = self.header_offset(height_start)
-        self.headers_file.write(offset, b''.join(flush_data.headers))
-        self.fs_update_header_offsets(offset, height_start, flush_data.headers)
+        header_height = height_start
+        for header in flush_data.headers:
+            self.meta_db.put(HEADER_PREFIX + util.pack_le_uint64(header_height), header)
+            header_height += 1
         flush_data.headers.clear()
 
         offset = height_start * self.tx_counts.itemsize
@@ -350,19 +353,6 @@ class LevelDB:
                          f'{elapsed:.1f}s.  Height {flush_data.height:,d} '
                          f'txs: {flush_data.tx_count:,d} ({tx_delta:+,d})')
 
-    def fs_update_header_offsets(self, offset_start, height_start, headers):
-        if self.coin.STATIC_BLOCK_HEADERS:
-            return
-        offset = offset_start
-        offsets = []
-        for h in headers:
-            offset += len(h)
-            offsets.append(pack("<Q", offset))
-        # For each header we get the offset of the next header, hence we
-        # start writing from the next height
-        pos = (height_start + 1) * 8
-        self.headers_offsets_file.write(pos, b''.join(offsets))
-
     def dynamic_header_offset(self, height):
         assert not self.coin.STATIC_BLOCK_HEADERS
         offset, = unpack('<Q', self.headers_offsets_file.read(height * 8, 8))
@@ -403,11 +393,11 @@ class LevelDB:
             # Read some from disk
             disk_count = max(0, min(count, self.db_height + 1 - start_height))
             if disk_count:
-                offset = self.header_offset(start_height)
-                size = self.header_offset(start_height + disk_count) - offset
-                return self.headers_file.read(offset, size), disk_count
+                return b''.join(
+                    self.meta_db.get(HEADER_PREFIX + util.pack_le_uint64(height))
+                    for height in range(start_height, start_height + disk_count)
+                ), disk_count
             return b'', 0
-
         return await asyncio.get_event_loop().run_in_executor(self.executor, read_headers)
 
     def fs_tx_hash(self, tx_num):
@@ -428,9 +418,8 @@ class LevelDB:
         offset = 0
         headers = []
         for n in range(count):
-            hlen = self.header_len(height + n)
-            headers.append(headers_concat[offset:offset + hlen])
-            offset += hlen
+            headers.append(headers_concat[offset:offset + self.coin.BASIC_HEADER_SIZE])
+            offset += self.coin.BASIC_HEADER_SIZE
 
         return [self.coin.header_hash(header) for header in headers]
 
