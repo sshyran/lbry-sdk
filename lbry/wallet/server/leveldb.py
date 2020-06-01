@@ -66,7 +66,7 @@ class LevelDB:
         self.logger = util.class_logger(__name__, self.__class__.__name__)
         self.env = env
         self.coin = env.coin
-        self.executor = ThreadPoolExecutor(max(1, os.cpu_count() - 1))
+        self.executor = None
 
         self.logger.info(f'switching current directory to {env.db_dir}')
 
@@ -93,20 +93,23 @@ class LevelDB:
 
         def get_counts():
             return tuple(
-                util.unpack_le_uint64_from(cnt)[0]
-                for cnt in self.meta_db.iterator(prefix=TX_COUNT_PREFIX, include_key=False)
+                util.unpack_be_uint64(tx_count)
+                for tx_count in self.meta_db.iterator(prefix=TX_COUNT_PREFIX, include_key=False)
             )
 
         tx_counts = await asyncio.get_event_loop().run_in_executor(self.executor, get_counts)
-        assert len(tx_counts) == (self.db_height + 1), f"{len(tx_counts)} vs {self.db_height + 1}"
+        assert len(tx_counts) - (1 if self.db_height <= 0 else 2) == self.db_height
         self.tx_counts = array.array('I', tx_counts)
 
         if self.tx_counts:
-            assert self.db_tx_count == self.tx_counts[-1]
+            assert self.db_tx_count == self.tx_counts[-1], \
+                f"{self.db_tx_count} vs {self.tx_counts[-1]} ({len(self.tx_counts)} counts)"
         else:
             assert self.db_tx_count == 0
 
     async def _open_dbs(self, for_sync, compacting):
+        if self.executor is None:
+            self.executor = ThreadPoolExecutor(max(1, os.cpu_count() - 1))
         self.meta_db = self.db_class('meta', for_sync)
         if self.meta_db.is_new:
             self.logger.info('created new headers db')
@@ -123,7 +126,6 @@ class LevelDB:
         if self.utxo_db.is_new:
             self.logger.info('created new database')
             self.logger.info('creating metadata directory')
-
         else:
             self.logger.info(f'opened UTXO DB (for sync: {for_sync})')
         self.read_utxo_state()
@@ -141,7 +143,9 @@ class LevelDB:
         self.utxo_db.close()
         self.history.close_db()
         self.meta_db.close()
+        self.tx_counts = None
         self.executor.shutdown(wait=True)
+        self.executor = None
 
     async def open_for_compacting(self):
         await self._open_dbs(True, True)
@@ -261,7 +265,7 @@ class LevelDB:
         height_start = self.fs_height + 1
         header_height = height_start
         for header in flush_data.headers:
-            self.meta_db.put(HEADER_PREFIX + util.pack_le_uint64(header_height), header)
+            self.meta_db.put(HEADER_PREFIX + util.pack_be_uint64(header_height), header)
             header_height += 1
         flush_data.headers.clear()
 
@@ -271,14 +275,18 @@ class LevelDB:
             while offset < len(tx_hashes):
                 tx_hash = tx_hashes[offset:offset+32]
                 offset += 32
-                self.meta_db.put(TX_HASH_PREFIX + util.pack_le_uint64(tx_num), tx_hash)
+                self.meta_db.put(TX_HASH_PREFIX + util.pack_be_uint64(tx_num), tx_hash)
                 tx_num += 1
         flush_data.block_tx_hashes.clear()
 
         count_height = height_start
         for tx_count in self.tx_counts[height_start:]:
-            self.meta_db.put(TX_COUNT_PREFIX + util.pack_le_uint64(count_height), util.pack_le_uint64(tx_count))
+            self.meta_db.put(TX_COUNT_PREFIX + util.pack_be_uint64(count_height), util.pack_be_uint64(tx_count))
             count_height += 1
+        self.meta_db.put(
+            TX_COUNT_PREFIX + util.pack_be_uint64(count_height),
+            util.pack_be_uint64(flush_data.tx_count)
+        )
 
         self.fs_height = flush_data.height
         self.fs_tx_count = flush_data.tx_count
@@ -395,7 +403,7 @@ class LevelDB:
             disk_count = max(0, min(count, self.db_height + 1 - start_height))
             if disk_count:
                 return b''.join(
-                    self.meta_db.get(HEADER_PREFIX + util.pack_le_uint64(height))
+                    self.meta_db.get(HEADER_PREFIX + util.pack_be_uint64(height))
                     for height in range(start_height, start_height + disk_count)
                 ), disk_count
             return b'', 0
@@ -409,7 +417,7 @@ class LevelDB:
         if tx_height > self.db_height:
             tx_hash = None
         else:
-            tx_hash = self.meta_db.get(TX_HASH_PREFIX + util.pack_le_uint64(tx_num))
+            tx_hash = self.meta_db.get(TX_HASH_PREFIX + util.pack_be_uint64(tx_num))
         return tx_hash, tx_height
 
     async def fs_block_hashes(self, height, count):
